@@ -29,6 +29,29 @@ $ git submodule init
 $ git submodule update
 
 
+# 4. Use a UE 5.4-compatible Visual Studio toolchain
+
+UE 5.4 is picky about MSVC/SDK combos. If you only have very new MSVC (14.44+), UBT can fail.
+
+Install these via Visual Studio Installer:
+
+MSVC v143 build tools (specifically 14.38.x or 14.39.x side-by-side)
+
+Windows 10/11 SDK 10.0.22621.0 (or at least 10.0.22000+) 
+Reddit
+
+Then in VS Installer:
+Individual components → check
+
+MSVC v143 - VS 2022 C++ x64/x86 build tools (v14.38/14.39)
+
+Windows 11 SDK (10.0.22621.0)
+
+# You don’t need to uninstall 14.44; just add the older v143 toolset so UE can select it.
+
+
+
+
 
 
 
