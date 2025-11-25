@@ -19,3 +19,7 @@ Plugins/*/Intermediate/
 
 # Git Bash accidental file
 nul
+
+# Visual Studio upgrade logs
+UpgradeLog.htm
+UpgradeLog*.htm
