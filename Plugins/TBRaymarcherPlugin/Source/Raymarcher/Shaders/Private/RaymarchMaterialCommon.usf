@@ -1,0 +1,89 @@
+
+// Copyright 2021 Tomas Bartipan and Technical University of Munich.
+// Licensed under MIT license - See License.txt for details.
+// Special credits go to : Temaran (compute shader tutorial), TheHugeManatee (original concept, supervision) and Ryan Brucks
+// (original raymarching code).
+
+// This file contains functions used for raymarching in in-game materials, not for precomputing. 
+
+// Beware, modifications to this file will not be detected by the material shaders and they will not
+// be recompiled. Shaders using this file have to be recompiled manually! (unless I find a way
+// to tell the shadercompiler to always recompile the raymarch shaders on startup)
+
+// Notice we're using FMaterialPixelParameters and Primitive, which are not defined by us anywhere. 
+// Since this file is only used in materials, we know that these structs are defined and provided to us 
+// by the magical shader compiler environment. Lurk through the generated HLSL file to see other nice 
+// structs that can be stolen like this.
+
+#pragma once
+#include "RaymarcherCommon.usf"
+
+// Performs raymarch cube setup for this pixel. Returns the position of entry to the cube in rgb channels 
+// and thickness of the cube in alpha. All values returned are in UVW space.
+float4 PerformRaymarchCubeSetup(FMaterialPixelParameters MaterialParameters)
+{
+    // Get scene depth at this pixel.
+    float LocalSceneDepth = CalcSceneDepth(ScreenAlignedPosition(GetScreenPosition(MaterialParameters)));
+    
+    // Get camera forward vector in world space.
+    float3 CameraFWDVecWorld = mul(float3(0.00000000, 0.00000000, 1.00000000), ResolvedView.ViewToTranslatedWorld);
+
+    // Get world space vector going from camera center to current scene depth.
+    float3 WorldDepthVec = normalize(MaterialParameters.CameraVector) * LocalSceneDepth;
+
+    // Transform this vector into the box's local space
+    WorldDepthVec = mul(WorldDepthVec, LWCHackToFloat(GetPrimitiveData(MaterialParameters.PrimitiveId).WorldToLocal));
+
+    // Get actual depth in local space, account for mesh bounds (by default, we use a centered 1x1x1 cube mesh, so this is unnecessary)
+    LocalSceneDepth = length(WorldDepthVec);
+    
+    // We use unit cubes now, uncomment this if you want to use non-unit meshes for some reason.
+    // LocalSceneDepth /= (GetPrimitiveData(MaterialParameters.PrimitiveId).LocalObjectBoundsMax.x * 2);
+
+    // Account for difference between camera center vector and camera-to-pixel depth
+    LocalSceneDepth /= abs(dot(CameraFWDVecWorld, MaterialParameters.CameraVector));
+
+    // Get cam pos and vector into local space too.
+    float3 LocalCamPos = mul(float4(LWCHackToFloat(ResolvedView.WorldCameraOrigin), 1.00000000), LWCHackToFloat(GetPrimitiveData(MaterialParameters.PrimitiveId).WorldToLocal)).xyz;
+    float3 LocalCamVec = -normalize(mul(MaterialParameters.CameraVector, LWCHackToFloat(GetPrimitiveData(MaterialParameters.PrimitiveId).WorldToLocal)));
+
+    // Transform camera pos from object-local to UVW coords (from +-0.5 to [0 - 1]).
+    LocalCamPos += 0.5;
+
+	// Get times (or distances from LocalCamPos along LocalCamVec) to the box entry and exit.
+	float2 EntryExitTimes = RayAABBIntersection(LocalCamPos, LocalCamVec, 0, 1);
+	
+    // Make sure the entry point is not behind the camera
+    EntryExitTimes.x = max(0, EntryExitTimes.x);
+
+    // Make sure the exit point is not behind other scene geometry.
+	EntryExitTimes.y = min(LocalSceneDepth, EntryExitTimes.y);
+
+    // Calculate box thickness at this pixel (in local space).
+    float BoxThickness = max(0, EntryExitTimes.y - EntryExitTimes.x);
+
+    // Get entry position in UVW space.
+    float3 EntryPos = LocalCamPos + (EntryExitTimes.x * LocalCamVec);
+    
+    return float4(EntryPos, BoxThickness);
+}
+
+
+// Jitter position by random temporal jitter (in the direction of the camera).
+void JitterEntryPos(inout float3 EntryPos, float3 LocalCamVec, FMaterialPixelParameters MaterialParameters)
+{
+    int3 RandomPos = int3(MaterialParameters.SvPosition.xy, View.StateFrameIndexMod8);
+    float rand = float(Rand3DPCG16(RandomPos).x) / 0xffff;
+    EntryPos -= LocalCamVec * rand;
+}
+
+
+// Adds current sampled color and opacity to the accumulated LightEnergy
+void AccumulateLightEnergy(inout float4 LightEnergy, in float4 CurrentSample)
+{
+    // Affect the color depending on how much opaque the current sample is and how strong the existing accumulated Light Energy is.
+    LightEnergy.rgb = LightEnergy.rgb + (CurrentSample.rgb * CurrentSample.a * (1.0 - LightEnergy.a));
+    // Affect the accumulated light energy strength.
+    LightEnergy.a = LightEnergy.a + (CurrentSample.a * (1.0 - LightEnergy.a));
+}
+

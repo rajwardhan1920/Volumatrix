@@ -1,0 +1,52 @@
+// Copyright 2021 Tomas Bartipan and Technical University of Munich.
+// Licensed under MIT license - See License.txt for details.
+// Special credits go to : Temaran (compute shader tutorial), TheHugeManatee (original concept, supervision) and Ryan Brucks
+// (original raymarching code).
+
+// This file contains functions used to sample a transfer function according to specified windowing parameters.
+
+// Beware, modifications to this file will not be detected by the material shaders and they will not
+// be recompiled. Shaders using this file have to be recompiled manually! (unless I find a way
+// to tell the shadercompiler to always recompile the raymarch shaders on startup)
+
+#pragma once
+
+float GetTransferFuncPosition(float Value, float WindowCenter, float WindowWidth)
+{
+    return (Value - WindowCenter + (WindowWidth / 2.0)) / WindowWidth;
+}
+
+// Transforms value from data volume to fit the Windowing parameters and then transforms it by the TF. Corrects the opacity to account for StepSize (in Unreal units).
+float4 SampleWindowedTransferFunction(float VolumeDataValue, float StepSize, Texture2D TF, SamplerState TFSampler, float4 WindowingParams)
+{
+    // WindowingParams.x == Center, WindowingParams.y = Width
+    float TFPos = GetTransferFuncPosition(VolumeDataValue, WindowingParams.x, WindowingParams.y);
+
+    // If TF position is above 1 and high cutoff is enabled or TF position is below 0 and low cutoff is enabled,
+    // return zero (value is not in the Transfer function range and we're cutting off values above or below the TF).
+	// @TODO This if could be eliminated by adding a fully transparent pixel to the correct side of the TF Texture. 
+    if ((TFPos < 0.0 && WindowingParams.z > 0.0) || (TFPos > 1.0 && WindowingParams.w > 0.0))
+    {
+        return float4(0, 0, 0, 0);
+    }
+
+    float4 ColorSample = TF.SampleLevel(TFSampler, float2(TFPos, 0.5), 0);
+    ColorSample.a = saturate(ColorSample.a);
+    ColorSample.a = 1.0 - pow(1.0 - ColorSample.a, StepSize);
+    return ColorSample;
+}
+
+// Samples and interpolate Data volume, transforms it to fit the Windowing parameters and then transforms it by the TF. Corrects the opacity to account for StepSize (in Unreal units).
+float4 SampleWindowedVolumeStep(float3 CurPos, float StepSize, Texture3D Volume, SamplerState VolumeSampler, Texture2D TF, SamplerState TFSampler, float4 WindowingParams)
+{
+	const float DataValue = Volume.SampleLevel(VolumeSampler, CurPos, 0).r;
+	return SampleWindowedTransferFunction(DataValue, StepSize, TF, TFSampler, WindowingParams);
+}
+
+// Samples the data volume based on actual texel coordinate, transforms it to fit the Windowing parameters and then transforms it by the TF. Corrects the opacity to account for StepSize (in Unreal units) 
+float4 SampleWindowedVolumeOctreeStep(int3 CurPos, float StepSize, Texture3D Volume, Texture2D TF, SamplerState TFSampler, float4 WindowingParams, float MipLevel = 0)
+{
+	int4 MipLevelPos = int4(CurPos.x, CurPos.y, CurPos.z, MipLevel);
+	const float DataValue = Volume.Load(MipLevelPos, 0).r;
+	return SampleWindowedTransferFunction(DataValue, StepSize, TF, TFSampler, WindowingParams);
+}

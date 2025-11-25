@@ -1,0 +1,95 @@
+// Copyright 2021 Tomas Bartipan and Technical University of Munich.
+// Licensed under MIT license - See License.txt for details.
+// Special credits go to : Temaran (compute shader tutorial), TheHugeManatee (original concept, supervision) and Ryan Brucks
+// (original raymarching code).
+
+// This file contains both files used by ligt propagation shaders and material shaders used in-editor.
+// After changing anything in this, the shaders in-editor need to be recompiled manually! (no file change detection there)
+//#include "WindowedHelpers.usf"
+
+#pragma once
+
+// The multiplier to use with the SQRT_3_HALF to get values fitting to a range of 0-1.
+#define ONE_OVER_SQRT_3 0.57735026919f
+
+// The fixed volume density. Used to multiply all StepSizes (when raymarching or calculating illumination).
+// Increasing this will lead to more opaque volumes, all other things being equal.
+// #TODO Find out what's the standard in e.g. Slicer or ITK and use that.
+#define VOLUME_DENSITY 100.0f
+
+// Returns true if CurPos is clipped by the clipping plane defined by the center and direction.
+// (Volume is clipped away in the clipping direction)
+bool IsCurPosClipped(float3 CurPos, float3 ClippingCenter, float3 ClippingDirection)
+{
+    return (dot(CurPos - ClippingCenter, ClippingDirection) <= 0.0);
+}
+
+// Convert a uint in one byte range (0-255) to a corresponding U8 float (0 - 1 normalized).
+float CharToFloat(uint inChar)
+{
+    return ((float) inChar) / 255.0;
+}
+
+// Convert a normalized 0-1 float to a 0-255 uint;
+uint FloatToChar(float inFloat)
+{
+    return (uint) round(inFloat * 255.0);
+}
+
+// Transforms pixel position into UVWs of the given voxel's center (center is why we add 0.5)
+float3 GetUVW(uint3 pos, float3 dimensions)
+{
+    return (pos + float3(0.5, 0.5, 0.5)) / dimensions;
+}
+
+// Returns intensity corrected for stepsize.
+float CorrectForStepSize(float Intensity, float StepSize)
+{
+    return 1.0 - pow(1.0 - Intensity, StepSize);
+}
+
+// Go from UVW coords to local coords of a unit cube (from [0, 1] to [-0.5, 0.5])
+float3 UVWToUnitLocal(float3 UVW)
+{
+    return (UVW - 0.5);
+}
+
+// Go from Local coords of a unit cube to UVW (from [-0.5, 0.5] to [0, 1])
+float3 UnitLocaltoUVW(float3 Local)
+{
+    return (Local + 0.5);
+}
+
+// Returns the times at which the ray intersects the box. 
+// If the ray is parallel to the box, the function will return 0.0f for both times.
+// If the RayOrigin is inside the box, the function will return 0.0f in result.x and the time at which the ray exits the box in result.y.
+float2 RayAABBIntersection(float3 RayOrigin, float3 RayDir, float3 BoxMin, float3 BoxMax)
+{
+	// Get inverse ray direction, used to determine the order of axis intersects.
+	float3 InverseRayDir = 1.0 / RayDir;
+
+	// TimeToAxisMins will have the distance travelled along the ray in X,Y,Z when it reaches BoxMin on the respective axis.
+	// e.g. TimeToAxisMin.x will have the distance travelled along the ray reaches BoxMin.x, TimeToAxisMin.y the distance to
+	// crossing BoxMin.y, etc. These distances be negative if that axis is crossed "behind" the origin.
+	float3 TimeToAxisMin = (BoxMin - RayOrigin) * InverseRayDir;
+	// TimeToAxisMaxes  will have the distance travelled along the ray in X,Y,Z when it reaches BoxMax on the respective axis.
+	float3 TimeToAxisMax = (BoxMax - RayOrigin) * InverseRayDir;
+
+	// Get closest and furthest intersections
+	float3 ClosestIntersections = min(TimeToAxisMax, TimeToAxisMin);
+	float3 FurthestIntersections = max(TimeToAxisMax, TimeToAxisMin);
+
+	// The actual intersections of the box are the 2 values in the middle of the pack.
+	// T0 (entry) = the farthest of the closest intersections
+	const float t0 = max(ClosestIntersections.x, max(ClosestIntersections.y, ClosestIntersections.z));
+	// T1 (exit) = the closest of the furthest intersections
+	const float t1 = min(FurthestIntersections.x, min(FurthestIntersections.y, FurthestIntersections.z));
+	return float2(t0, t1);
+}
+
+// Returns true if the ray intersects the box. Entry and exit times are stored in the EntryExitTimes parameter. 
+bool CheckedRayAABBIntersection(float3 RayOrigin, float3 RayDir, float3 BoxMin, float3 BoxMax, out float2 EntryExitTimes)
+{
+	EntryExitTimes = RayAABBIntersection(RayOrigin, RayDir, BoxMin, BoxMax);
+	return EntryExitTimes.y > max(EntryExitTimes.x, 0.0);
+}

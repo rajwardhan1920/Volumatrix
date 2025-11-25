@@ -1,0 +1,21 @@
+# Unreal generated folders
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vs/
+
+# Visual Studio / build files
+*.sln
+*.VC.db
+*.opensdf
+*.sdf
+*.suo
+*.log
+
+# Plugin generated folders
+Plugins/*/Binaries/
+Plugins/*/Intermediate/
+
+# Git Bash accidental file
+nul
