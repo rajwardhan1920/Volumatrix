@@ -22,9 +22,12 @@ $ git clone --recurse-submodules https://github.com/rajwardhan1920/Volumatrix.gi
 
 Or after a regular clone, perform a
 
+$ git lfs pull 
+
 $ git submodule init
 
 $ git submodule update
+
 
 
 
