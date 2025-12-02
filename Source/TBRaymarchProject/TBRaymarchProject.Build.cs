@@ -1,6 +1,5 @@
 // Copyright 2021 Tomas Bartipan and Technical University of Munich.
 // Licensed under MIT license - See License.txt for details.
-// Special credits go to : Temaran (compute shader tutorial), TheHugeManatee (original concept, supervision) and Ryan Brucks (original raymarching code).
 
 using UnrealBuildTool;
 
@@ -10,8 +9,22 @@ public class TBRaymarchProject : ModuleRules
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
-        PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore"});
+        PublicDependencyModuleNames.AddRange(
+            new string[]
+            {
+                "Core",
+                "CoreUObject",
+                "Engine",
+                "InputCore",
+                "RenderCore",
+                "RHI",
+                // Needed to use ARaymarchVolume / RaymarchResources
+                "Raymarcher"
+            });
 
-        PrivateDependencyModuleNames.AddRange(new string[] { });
+        PrivateDependencyModuleNames.AddRange(
+            new string[]
+            {
+            });
     }
 }
