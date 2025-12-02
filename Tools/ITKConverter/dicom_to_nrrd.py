@@ -5,7 +5,12 @@ import itk
 
 
 def load_dicom_series(dicom_dir: str):
-    # ITK ImageSeriesReader will auto-detect series and sort by ImagePositionPatient/InstanceNumber
+    """
+    Load the first valid DICOM series found in a folder.
+
+    For now we just pick the first SeriesInstanceUID that GDCM finds.
+    Later we can add an option to choose which series to export.
+    """
     pixel_type = itk.ctype('signed short')
     image_type = itk.Image[pixel_type, 3]
 
@@ -17,9 +22,14 @@ def load_dicom_series(dicom_dir: str):
     if len(series_uids) == 0:
         raise RuntimeError(f"No DICOM series found in {dicom_dir}")
 
+    print("Found series UIDs:")
+    for idx, uid in enumerate(series_uids):
+        print(f"  [{idx}] {uid}")
+
     # For now, just take the first series
     series_uid = series_uids[0]
     file_names = names_generator.GetFileNames(series_uid)
+    print(f"Using series index 0, UID={series_uid}, number of slices={len(file_names)}")
 
     reader.SetFileNames(file_names)
     reader.Update()
@@ -29,76 +39,88 @@ def load_dicom_series(dicom_dir: str):
 
 
 def apply_hu_scaling(image):
-    # Read rescale slope/intercept from metadata if present
-    # We assume all slices share the same values, so we check the first one
-    # NOTE: If this fails, we just return the original image (not ideal, but safe fallback).
-    meta_dict = image.GetMetaDataDictionary()
+    """
+    Apply HU = raw * slope + intercept if DICOM metadata has RescaleSlope/Intercept.
+    Falls back to identity if not found.
+    """
     slope = 1.0
     intercept = 0.0
 
-    for key in meta_dict.GetKeys():
-        if "RescaleSlope" in key:
-            slope = float(itk.template(meta_dict)[1].GetMetaDataObjectValue(meta_dict, key))
-        if "RescaleIntercept" in key:
-            intercept = float(itk.template(meta_dict)[1].GetMetaDataObjectValue(meta_dict, key))
+    try:
+        meta_dict = image.GetMetaDataDictionary()
+        keys = list(meta_dict.GetKeys())
+        for key in keys:
+            if "RescaleSlope" in key:
+                slope = float(itk.template(meta_dict)[1].GetMetaDataObjectValue(meta_dict, key))
+            if "RescaleIntercept" in key:
+                intercept = float(itk.template(meta_dict)[1].GetMetaDataObjectValue(meta_dict, key))
+    except Exception as e:
+        print("Warning: could not read RescaleSlope/Intercept, using defaults 1/0:", e)
 
-    # Convert to numpy, apply HU, then cast back to int16
-    arr = itk.GetArrayFromImage(image).astype(np.float32)
+    arr = itk.GetArrayFromImage(image).astype(np.float32)  # [z, y, x]
     hu = arr * slope + intercept
-    hu = np.clip(hu, -1024, 3071)  # reasonable CT brain range
-    hu = hu.astype(np.int16)
 
-    hu_image = itk.GetImageFromArray(hu)
+    # Clip to a sane CT range and cast to int16
+    hu = np.clip(hu, -1024, 3071).astype(np.int16)
+
+    hu_image = itk.GetImageFromArray(hu)  # back to ITK, still [z, y, x] logically
     hu_image.CopyInformation(image)
     return hu_image
 
 
 def write_nrrd_raw(image, nhdr_path: str, raw_path: str):
-    # Convert to numpy
-    arr = itk.GetArrayFromImage(image)  # shape: [z, y, x]
-    # ITK's GetArrayFromImage gives z-fastest; NRRD default is dimension: 3, sizes: x y z
-    # We'll write RAW in x-fastest order, so we must transpose.
-    arr_for_nrrd = np.transpose(arr, (2, 1, 0))  # [x, y, z]
-    arr_for_nrrd = arr_for_nrrd.astype(np.int16)
+    """
+    Minimal, Slicer-friendly NRRD writer.
 
-    # Write raw binary
+    - Uses the array exactly as GetArrayFromImage gives it: [z, y, x]
+    - Writes sizes in the SAME order: sizes: Z Y X
+    - Does not try to be clever with space directions yet.
+    """
+    # ITK -> numpy: shape [z, y, x]
+    arr = itk.GetArrayFromImage(image)  # [z, y, x]
+    arr = arr.astype(np.int16, copy=False)
+
+    # Verify shape against ITK size
+    size_x, size_y, size_z = image.GetLargestPossibleRegion().GetSize()  # ITK order: (x, y, z)
+    if arr.shape != (size_z, size_y, size_x):
+        print("Warning: array shape and ITK size mismatch:",
+              "arr.shape =", arr.shape,
+              "ITK size =", (size_z, size_y, size_x))
+
+    # Write raw binary exactly in this [z, y, x] order
     with open(raw_path, "wb") as f:
-        arr_for_nrrd.tofile(f)
+        arr.tofile(f)
 
-    # Header info
-    size_x, size_y, size_z = arr_for_nrrd.shape
-    spacing = image.GetSpacing()  # (sx, sy, sz)
-    origin = image.GetOrigin()    # (ox, oy, oz)
-    direction = image.GetDirection()  # 3x3 ITK direction cosine matrix
-
-    # Convert direction to rows for NRRD "space directions"
-    # ITK uses LPS; we'll declare NRRD space as "left-posterior-superior"
-    dir_matrix = np.array(direction)
-    sx = "({:.6f},{:.6f},{:.6f})".format(* (dir_matrix[:, 0] * spacing[0]))
-    sy = "({:.6f},{:.6f},{:.6f})".format(* (dir_matrix[:, 1] * spacing[1]))
-    sz = "({:.6f},{:.6f},{:.6f})".format(* (dir_matrix[:, 2] * spacing[2]))
-
+    # IMPORTANT: sizes MUST match the array order we wrote: Z Y X
+    size_z, size_y, size_x = arr.shape  # note the order
     header = []
     header.append("NRRD0005")
-    header.append("# VoluMatrix intensity volume")
+    header.append("# VoluMatrix intensity volume (simple writer)")
     header.append("type: short")
     header.append("dimension: 3")
-    header.append(f"sizes: {size_x} {size_y} {size_z}")
+    header.append(f"sizes: {size_z} {size_y} {size_x}")
     header.append("encoding: raw")
     header.append("endian: little")
-    header.append("space: left-posterior-superior")
-    header.append(f"space origin: ({origin[0]:.6f},{origin[1]:.6f},{origin[2]:.6f})")
-    header.append(f"space directions: {sx} {sy} {sz}")
+
+    # Simple axis definitions: index space, not real patient space yet
+    header.append("space: right-anterior-superior")
+    header.append("space directions: (1,0,0) (0,1,0) (0,0,1)")
+    header.append("space origin: (0,0,0)")
     header.append(f"data file: {os.path.basename(raw_path)}")
 
     with open(nhdr_path, "w") as f:
         f.write("\n".join(header) + "\n")
 
+    print("Wrote NRRD:")
+    print("  nhdr:", nhdr_path)
+    print("  raw :", raw_path)
+    print("  sizes (Z Y X):", size_z, size_y, size_x)
+
 
 def main():
     if len(sys.argv) != 3:
         print("Usage: python dicom_to_nrrd.py <dicom_folder> <output_basename>")
-        print("Example: python dicom_to_nrrd.py ./SampleDICOM ./output/intensity")
+        print("Example: python dicom_to_nrrd.py \"D:\\VM REPO\\Volumatrix\\Dcm Files\\SampleDICOM\" ./output/patient1")
         sys.exit(1)
 
     dicom_dir = sys.argv[1]
@@ -107,18 +129,23 @@ def main():
     if not os.path.isdir(dicom_dir):
         raise RuntimeError(f"Not a directory: {dicom_dir}")
 
-    os.makedirs(os.path.dirname(out_base), exist_ok=True)
+    out_dir = os.path.dirname(out_base)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
 
     print(f"Loading DICOM series from: {dicom_dir}")
     image = load_dicom_series(dicom_dir)
+
     print("Applying HU scaling...")
     hu_image = apply_hu_scaling(image)
 
     nhdr_path = out_base + ".nhdr"
     raw_path = out_base + ".raw"
+
     print(f"Writing NRRD header: {nhdr_path}")
     print(f"Writing RAW data: {raw_path}")
     write_nrrd_raw(hu_image, nhdr_path, raw_path)
+
     print("Done.")
 
 

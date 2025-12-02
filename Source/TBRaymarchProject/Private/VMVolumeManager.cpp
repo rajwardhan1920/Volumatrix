@@ -1,10 +1,7 @@
-// VoluMatrix volume manager implementation.
-
 #include "VMVolumeManager.h"
 
 #include "Engine/VolumeTexture.h"
 #include "HAL/PlatformFilemanager.h"
-#include "Logging/LogMacros.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 
@@ -20,43 +17,36 @@ void AVMVolumeManager::BeginPlay()
 	Super::BeginPlay();
 }
 
-// ------------------------
-// NRRD parsing helpers
-// ------------------------
-
+// ---------------------------------------------------------
+// Helper: parse "sizes: 195 512 512"
+// ---------------------------------------------------------
 static bool ParseIntList(const FString& InString, TArray<int32>& OutValues)
 {
 	OutValues.Empty();
 	TArray<FString> Parts;
 	InString.ParseIntoArrayWS(Parts);
-
 	for (const FString& Part : Parts)
 	{
-		if (Part.IsEmpty())
+		int32 V = 0;
+		if (LexTryParseString(V, *Part))
 		{
-			continue;
+			OutValues.Add(V);
 		}
-
-		int32 Value = 0;
-		if (!LexTryParseString(Value, *Part))
-		{
-			return false;
-		}
-		OutValues.Add(Value);
 	}
-
 	return OutValues.Num() > 0;
 }
 
+// ---------------------------------------------------------
+// Parse NRRD header
+// ---------------------------------------------------------
 bool AVMVolumeManager::ParseNRRDHeader(const FString& NhdrFilePath, FVMNRRDHeaderInfo& OutHeader, FString& OutError)
 {
 	OutHeader = FVMNRRDHeaderInfo{};
-	OutError.Empty();
-
 	FString FileText;
+
 	if (!FFileHelper::LoadFileToString(FileText, *NhdrFilePath))
 	{
-		OutError = FString::Printf(TEXT("Failed to read NRRD header: %s"), *NhdrFilePath);
+		OutError = TEXT("Failed to read header.");
 		return false;
 	}
 
@@ -65,183 +55,135 @@ bool AVMVolumeManager::ParseNRRDHeader(const FString& NhdrFilePath, FVMNRRDHeade
 
 	if (Lines.Num() == 0 || !Lines[0].StartsWith(TEXT("NRRD")))
 	{
-		OutError = TEXT("File does not look like a NRRD header (missing NRRD000X line).");
+		OutError = TEXT("Not a valid NRRD header");
 		return false;
 	}
 
-	for (int32 i = 1; i < Lines.Num(); ++i)
+	for (const FString& Line : Lines)
 	{
-		const FString& Line = Lines[i];
-
-		if (Line.IsEmpty() || Line.StartsWith(TEXT("#")))
+		if (Line.StartsWith("#") || !Line.Contains(":"))
 		{
 			continue;
 		}
 
 		FString Key, Value;
-		if (!Line.Split(TEXT(":"), &Key, &Value))
-		{
-			continue;
-		}
-
+		Line.Split(TEXT(":"), &Key, &Value);
 		Key = Key.TrimStartAndEnd();
 		Value = Value.TrimStartAndEnd();
 
-		if (Key.Equals(TEXT("sizes"), ESearchCase::IgnoreCase))
+		if (Key.Equals(TEXT("sizes")))
 		{
-			TArray<int32> Sizes;
-			if (!ParseIntList(Value, Sizes) || Sizes.Num() != 3)
+			TArray<int32> S;
+			if (!ParseIntList(Value, S) || S.Num() != 3)
 			{
-				OutError = TEXT("Invalid sizes line in NRRD header.");
+				OutError = TEXT("Invalid sizes.");
 				return false;
 			}
 
-			// Our exporter writes sizes: Z Y X
-			OutHeader.SizeZ = Sizes[0];
-			OutHeader.SizeY = Sizes[1];
-			OutHeader.SizeX = Sizes[2];
+			// Our exporter uses Z Y X order
+			OutHeader.SizeZ = S[0];
+			OutHeader.SizeY = S[1];
+			OutHeader.SizeX = S[2];
 		}
-		else if (Key.Equals(TEXT("type"), ESearchCase::IgnoreCase))
+		else if (Key.Equals(TEXT("type")))
 		{
 			OutHeader.Type = Value;
 		}
-		else if (Key.Equals(TEXT("encoding"), ESearchCase::IgnoreCase))
+		else if (Key.Equals(TEXT("encoding")))
 		{
 			OutHeader.Encoding = Value;
 		}
-		else if (Key.Equals(TEXT("endian"), ESearchCase::IgnoreCase))
+		else if (Key.Equals(TEXT("endian")))
 		{
 			OutHeader.Endian = Value;
 		}
-		else if (Key.Equals(TEXT("data file"), ESearchCase::IgnoreCase))
+		else if (Key.Equals(TEXT("data file")))
 		{
 			OutHeader.DataFileName = Value;
 		}
 	}
 
-	if (OutHeader.SizeX <= 0 || OutHeader.SizeY <= 0 || OutHeader.SizeZ <= 0)
-	{
-		OutError = TEXT("NRRD header missing valid sizes.");
-		return false;
-	}
-
 	if (OutHeader.DataFileName.IsEmpty())
 	{
-		OutError = TEXT("NRRD header missing data file field.");
-		return false;
-	}
-
-	if (OutHeader.Type.IsEmpty())
-	{
-		OutError = TEXT("NRRD header missing type field.");
-		return false;
-	}
-
-	if (OutHeader.Encoding.IsEmpty())
-	{
-		OutError = TEXT("NRRD header missing encoding field.");
+		OutError = TEXT("Missing data file.");
 		return false;
 	}
 
 	return true;
 }
 
+// ---------------------------------------------------------
+// Load RAW
+// ---------------------------------------------------------
 bool AVMVolumeManager::LoadRawData(
 	const FString& NhdrFilePath, const FVMNRRDHeaderInfo& Header, TArray<uint8>& OutBytes, FString& OutError)
 {
 	OutBytes.Empty();
-	OutError.Empty();
 
-	if (!Header.Encoding.Equals(TEXT("raw"), ESearchCase::IgnoreCase))
+	FString Dir = FPaths::GetPath(NhdrFilePath);
+	FString RawPath = Dir / Header.DataFileName;
+
+	if (!FPaths::FileExists(RawPath))
 	{
-		OutError = FString::Printf(TEXT("Only encoding=raw supported, got: %s"), *Header.Encoding);
-		return false;
-	}
-
-	if (!Header.Type.Equals(TEXT("short"), ESearchCase::IgnoreCase) && !Header.Type.Equals(TEXT("int16"), ESearchCase::IgnoreCase))
-	{
-		OutError = FString::Printf(TEXT("Only type=short/int16 supported, got: %s"), *Header.Type);
-		return false;
-	}
-
-	const FString NhdrDir = FPaths::GetPath(NhdrFilePath);
-	const FString RawPath = FPaths::ConvertRelativePathToFull(NhdrDir / Header.DataFileName);
-
-	IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
-	if (!PlatformFile.FileExists(*RawPath))
-	{
-		OutError = FString::Printf(TEXT("Raw data file not found: %s"), *RawPath);
+		OutError = FString::Printf(TEXT("RAW file missing: %s"), *RawPath);
 		return false;
 	}
 
 	if (!FFileHelper::LoadFileToArray(OutBytes, *RawPath))
 	{
-		OutError = FString::Printf(TEXT("Failed to read raw data file: %s"), *RawPath);
+		OutError = TEXT("Failed to read RAW");
 		return false;
-	}
-
-	const int64 ExpectedBytes = int64(Header.SizeX) * Header.SizeY * Header.SizeZ * 2;
-	if (OutBytes.Num() != ExpectedBytes)
-	{
-		UE_LOG(LogVMVolumeManager, Warning, TEXT("Raw size (%d) != expected (%lld) for %dx%dx%d"), OutBytes.Num(), ExpectedBytes,
-			Header.SizeX, Header.SizeY, Header.SizeZ);
 	}
 
 	return true;
 }
 
+// ---------------------------------------------------------
+// Create UVolumeTexture (UE 5.4 API)
+// ---------------------------------------------------------
 UVolumeTexture* AVMVolumeManager::CreateVolumeTextureFromRaw16(const FVMNRRDHeaderInfo& Header, const TArray<uint8>& Bytes)
 {
-	if (Header.SizeX <= 0 || Header.SizeY <= 0 || Header.SizeZ <= 0)
+	const int32 SX = Header.SizeX;
+	const int32 SY = Header.SizeY;
+	const int32 SZ = Header.SizeZ;
+
+	UVolumeTexture* VolTex = NewObject<UVolumeTexture>(GetTransientPackage());
+	if (!VolTex)
 	{
-		UE_LOG(LogVMVolumeManager, Error, TEXT("Invalid volume dimensions."));
+		UE_LOG(LogVMVolumeManager, Error, TEXT("Failed to allocate VolumeTexture."));
 		return nullptr;
 	}
 
-	const int32 SizeX = Header.SizeX;
-	const int32 SizeY = Header.SizeY;
-	const int32 SizeZ = Header.SizeZ;
+	VolTex->bNotOfflineProcessed = true;
+	VolTex->CompressionSettings = TC_Default;
+	VolTex->MipGenSettings = TMGS_NoMipmaps;
+	VolTex->SRGB = false;
 
-	UVolumeTexture* VolumeTex = NewObject<UVolumeTexture>(GetTransientPackage());
-	if (!VolumeTex)
+	// UE 5.4 Source.Init()
+	VolTex->Source.Init(SX, SY, SZ, 1, TSF_G16);
+
+	uint8* Dest = VolTex->Source.LockMip(0);
+	const int64 ExpectedBytes = int64(SX) * SY * SZ * 2;
+
+	const int64 CopyBytes = FMath::Min<int64>(ExpectedBytes, Bytes.Num());
+	FMemory::Memcpy(Dest, Bytes.GetData(), CopyBytes);
+
+	if (CopyBytes < ExpectedBytes)
 	{
-		UE_LOG(LogVMVolumeManager, Error, TEXT("Failed to create UVolumeTexture."));
-		return nullptr;
+		FMemory::Memset(Dest + CopyBytes, 0, ExpectedBytes - CopyBytes);
 	}
 
-	VolumeTex->bNotOfflineProcessed = true;
-	VolumeTex->CompressionSettings = TC_Default;
-	VolumeTex->MipGenSettings = TMGS_NoMipmaps;
-	VolumeTex->SRGB = false;
+	VolTex->Source.UnlockMip(0);
+	VolTex->UpdateResource();
 
-	// UE 5.4: width, height, NumSlices, NumMips, format
-	VolumeTex->Source.Init(SizeX, SizeY, SizeZ, 1, ETextureSourceFormat::TSF_G16);
+	UE_LOG(LogVMVolumeManager, Log, TEXT("Created VolumeTexture %dx%dx%d"), SX, SY, SZ);
 
-	uint8* DestData = VolumeTex->Source.LockMip(0);
-	const int64 DestBytes = int64(SizeX) * SizeY * SizeZ * 2;
-
-	const int64 CopyBytes = FMath::Min<int64>(DestBytes, (int64) Bytes.Num());
-	if (CopyBytes > 0)
-	{
-		FMemory::Memcpy(DestData, Bytes.GetData(), CopyBytes);
-	}
-	if (CopyBytes < DestBytes)
-	{
-		FMemory::Memset(DestData + CopyBytes, 0, DestBytes - CopyBytes);
-	}
-
-	VolumeTex->Source.UnlockMip(0);
-	VolumeTex->UpdateResource();
-
-	UE_LOG(LogVMVolumeManager, Log, TEXT("Created VolumeTexture (%dx%dx%d) from RAW, bytes=%d."), SizeX, SizeY, SizeZ, Bytes.Num());
-
-	return VolumeTex;
+	return VolTex;
 }
 
-// ------------------------
-// Public Blueprint API
-// ------------------------
-
+// ---------------------------------------------------------
+// Public: Load a NRRD intensity volume
+// ---------------------------------------------------------
 UVolumeTexture* AVMVolumeManager::LoadNRRDIntensity(const FString& NrrdHeaderPath)
 {
 	FString CleanPath = NrrdHeaderPath;
@@ -252,52 +194,45 @@ UVolumeTexture* AVMVolumeManager::LoadNRRDIntensity(const FString& NrrdHeaderPat
 
 	if (!ParseNRRDHeader(CleanPath, Header, Error))
 	{
-		UE_LOG(LogVMVolumeManager, Error, TEXT("ParseNRRDHeader failed: %s"), *Error);
+		UE_LOG(LogVMVolumeManager, Error, TEXT("Header parse failed: %s"), *Error);
 		return nullptr;
 	}
 
-	TArray<uint8> RawBytes;
-	if (!LoadRawData(CleanPath, Header, RawBytes, Error))
+	TArray<uint8> Bytes;
+	if (!LoadRawData(CleanPath, Header, Bytes, Error))
 	{
-		UE_LOG(LogVMVolumeManager, Error, TEXT("LoadRawData failed: %s"), *Error);
+		UE_LOG(LogVMVolumeManager, Error, TEXT("Raw load failed: %s"), *Error);
 		return nullptr;
 	}
 
-	UVolumeTexture* VolumeTexture = CreateVolumeTextureFromRaw16(Header, RawBytes);
-	if (!VolumeTexture)
-	{
-		UE_LOG(LogVMVolumeManager, Error, TEXT("CreateVolumeTextureFromRaw16 failed."));
-		return nullptr;
-	}
-
-	UE_LOG(LogVMVolumeManager, Log, TEXT("Loaded NRRD '%s' as VolumeTexture (%dx%dx%d)."), *CleanPath, Header.SizeX, Header.SizeY,
-		Header.SizeZ);
-
-	return VolumeTexture;
+	return CreateVolumeTextureFromRaw16(Header, Bytes);
 }
 
+// ---------------------------------------------------------
+// Apply texture to raymarcher
+// ---------------------------------------------------------
 void AVMVolumeManager::ApplyIntensityToRaymarcher(ARaymarchVolume* TargetVolume, UVolumeTexture* IntensityTex)
 {
 	if (!TargetVolume)
 	{
-		UE_LOG(LogVMVolumeManager, Warning, TEXT("ApplyIntensityToRaymarcher: TargetVolume is null."));
+		UE_LOG(LogVMVolumeManager, Warning, TEXT("TargetVolume null."));
 		return;
 	}
 
 	if (!IntensityTex)
 	{
-		UE_LOG(LogVMVolumeManager, Warning, TEXT("ApplyIntensityToRaymarcher: IntensityTex is null."));
+		UE_LOG(LogVMVolumeManager, Warning, TEXT("IntensityTex null."));
 		return;
 	}
 
-	// Plug our texture into the raymarch resources
-	TargetVolume->RaymarchResources.DataVolume = IntensityTex;
+	// 1) Plug the texture (THIS IS THE CORRECT FIELD)
+	TargetVolume->RaymarchResources.DataVolumeTextureRef = IntensityTex;
 
-	// Use the intensity material (simpler path, avoids light volume for now)
+	// 2) Switch to intensity-raymarch mode
 	TargetVolume->SelectRaymarchMaterial = ERaymarchMaterial::Intensity;
 
-	// Push parameters so the materials see the new volume
+	// 3) Push parameters
 	TargetVolume->SetAllMaterialParameters();
 
-	UE_LOG(LogVMVolumeManager, Log, TEXT("ApplyIntensityToRaymarcher: applied volume to raymarcher."));
+	UE_LOG(LogVMVolumeManager, Log, TEXT("Applied NRRD intensity texture to RaymarchVolume."));
 }

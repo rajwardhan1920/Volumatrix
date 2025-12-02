@@ -18,7 +18,7 @@ public class TBRaymarchProject : ModuleRules
                 "InputCore",
                 "RenderCore",
                 "RHI",
-                // Needed to use ARaymarchVolume / RaymarchResources
+                // Needed to use ARaymarchVolume
                 "Raymarcher"
             });
 
