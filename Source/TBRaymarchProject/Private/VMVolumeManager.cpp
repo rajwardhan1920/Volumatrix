@@ -209,7 +209,7 @@ UVolumeTexture* AVMVolumeManager::LoadNRRDIntensity(const FString& NrrdHeaderPat
 }
 
 // ---------------------------------------------------------
-// Apply texture to raymarcher
+// Apply texture to raymarcher (colored / Lit path)
 // ---------------------------------------------------------
 void AVMVolumeManager::ApplyIntensityToRaymarcher(ARaymarchVolume* TargetVolume, UVolumeTexture* IntensityTex)
 {
@@ -225,14 +225,14 @@ void AVMVolumeManager::ApplyIntensityToRaymarcher(ARaymarchVolume* TargetVolume,
 		return;
 	}
 
-	// 1) Plug the texture (THIS IS THE CORRECT FIELD)
+	// 1) Plug the texture into Raymarch resources (this is the correct field)
 	TargetVolume->RaymarchResources.DataVolumeTextureRef = IntensityTex;
 
-	// 2) Switch to intensity-raymarch mode
-	TargetVolume->SelectRaymarchMaterial = ERaymarchMaterial::Intensity;
+	// 2) Use the Lit renderer so transfer-function colors are applied
+	TargetVolume->SwitchRenderer(ERaymarchMaterial::Lit);
 
-	// 3) Push parameters
+	// 3) Push parameters (window/level, TF, etc.) to materials
 	TargetVolume->SetAllMaterialParameters();
 
-	UE_LOG(LogVMVolumeManager, Log, TEXT("Applied NRRD intensity texture to RaymarchVolume."));
+	UE_LOG(LogVMVolumeManager, Log, TEXT("Applied NRRD intensity texture to RaymarchVolume (Lit renderer)."));
 }
