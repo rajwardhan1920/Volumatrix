@@ -1,10 +1,12 @@
 // VMVolumeManager.h
-// VoluMatrix runtime loader for NRRD (intensity) volumes.
-// Responsible ONLY for: reading .nhdr header, loading .raw, and creating a UVolumeTexture.
+// VoluMatrix runtime NRRD loader.
 //
-// We intentionally do NOT depend on internal Raymarcher structs here.
-// Blueprints (or higher-level C++) will take the created UVolumeTexture and
-// assign it to ARaymarchVolume.RaymarchResources / widgets, etc.
+// This actor:
+//   - Reads a simple 3D NRRD header (.nhdr)
+//   - Loads the associated .raw file (16-bit signed intensity)
+//   - Builds a transient UVolumeTexture (PF_G16)
+//   - Exposes the resulting texture to Blueprint
+//   - Optionally logs min/max so you can pick window/width
 
 #pragma once
 
@@ -13,48 +15,51 @@
 
 #include "VMVolumeManager.generated.h"
 
-class UVolumeTexture;
 class ARaymarchVolume;
+class UVolumeTexture;
 
-// Simple struct describing only what we need from the NRRD header.
+/**
+ * Minimal parsed NRRD header info.
+ * Assumptions (must match dicom_to_nrrd.py):
+ *  - type: short
+ *  - dimension: 3
+ *  - encoding: raw
+ *  - endian: little
+ *  - sizes: Z Y X  (converter writes in that order)
+ */
 USTRUCT(BlueprintType)
-struct FVMNRRDHeaderInfo
+struct FVMNRRDHeader
 {
 	GENERATED_BODY()
 
-	// Dimensions in Unreal / VolumeTexture order.
-	// We always store as X (columns), Y (rows), Z (slices).
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix|NRRD")
-	int32 SizeX = 0;
+	// Texture dimensions in Unreal terms (VolumeTexture expects X,Y,Z)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
+	int32 SizeX = 0;	// columns (Nrrd axis 2)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
+	int32 SizeY = 0;	// rows    (Nrrd axis 1)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
+	int32 SizeZ = 0;	// slices  (Nrrd axis 0)
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix|NRRD")
-	int32 SizeY = 0;
+	// Full absolute path to the raw file
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
+	FString RawFilePath;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix|NRRD")
-	int32 SizeZ = 0;
+	// Bytes per voxel (we use 2 for int16)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
+	int32 BytesPerVoxel = 2;
 
-	// NRRD "type" field. We currently expect "short" (int16), matching the converter.
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix|NRRD")
-	FString Type;
+	// Endianness
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
+	bool bLittleEndian = true;
 
-	// Raw encoding mode, expected "raw".
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix|NRRD")
-	FString Encoding;
-
-	// Endianness, expected "little".
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix|NRRD")
-	FString Endian;
-
-	// Relative or absolute path to the .raw file as written in the NRRD header.
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix|NRRD")
-	FString DataFileName;
-
-	// Optional: voxel spacing, purely informational here (Unreal uses unit cube).
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix|NRRD")
-	FVector3f Spacing = FVector3f(1.0f, 1.0f, 1.0f);
+	// Intensity range computed from RAW
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
+	int32 MinValue = 0;
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
+	int32 MaxValue = 0;
 };
 
-UCLASS()
+UCLASS(Blueprintable)
 class TBRAYMARCHPROJECT_API AVMVolumeManager : public AActor
 {
 	GENERATED_BODY()
@@ -62,60 +67,62 @@ class TBRAYMARCHPROJECT_API AVMVolumeManager : public AActor
 public:
 	AVMVolumeManager();
 
-	// Path to the .nhdr file on disk.
-	// Example: D:/VM REPO/Volumatrix/Tools/ITKConverter/output/patient1.nhdr
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VoluMatrix|NRRD")
-	FString NrrdHeaderPath;
-
-	// Optional: Raymarcher volume that this manager is "responsible" for.
-	// You can leave this null and wire things manually in Blueprints if you prefer.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VoluMatrix|Raymarcher")
-	ARaymarchVolume* TargetRaymarchVolume;
-
-	// The last successfully loaded volume texture.
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix|NRRD")
-	UVolumeTexture* LoadedIntensityTexture;
-
-	// Parsed header for the last loaded NRRD (for debugging / tools).
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix|NRRD")
-	FVMNRRDHeaderInfo LastHeaderInfo;
-
-public:
-	// High-level helper: load NRRD from NrrdHeaderPath and, if TargetRaymarchVolume is set,
-	// assign the resulting UVolumeTexture to it via Blueprint or other logic.
-	// This is primarily for convenience in the level.
-	UFUNCTION(CallInEditor, BlueprintCallable, Category = "VoluMatrix|NRRD")
-	void LoadAndApplyNRRD();
-
-	// Static low-level loader: given a .nhdr path, parse it, read the .raw file,
-	// create a transient PF_G16 UVolumeTexture, and return it.
-	// Returns nullptr on failure (check log for details).
-	UFUNCTION(BlueprintCallable, Category = "VoluMatrix|NRRD")
-	static UVolumeTexture* LoadNRRDIntensity(const FString& InNrrdHeaderPath, FVMNRRDHeaderInfo& OutHeaderInfo);
-
-	// Optional helper that ONLY sets the provided intensity texture on a RaymarchVolume.
-	// We don't touch VolumeAsset/ImageInfo here to avoid coupling to plugin internals.
-	UFUNCTION(BlueprintCallable, Category = "VoluMatrix|Raymarcher")
-	static void ApplyIntensityToRaymarcher(ARaymarchVolume* RaymarchVolume, UVolumeTexture* IntensityTexture);
-
-protected:
 	virtual void BeginPlay() override;
 
+#if WITH_EDITOR
+	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
+
+	/** Optional: RaymarchVolume we want to drive. We don't touch its internals in C++ anymore. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VoluMatrix")
+	ARaymarchVolume* TargetRaymarchVolume;
+
+	/**
+	 * Absolute path to the .nhdr file.
+	 * Example:
+	 *   D:/VM REPO/Volumatrix/Tools/ITKConverter/output/patient1.nhdr
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VoluMatrix", meta = (FilePathFilter = "nhdr"))
+	FString NRRDPath;
+
+	/** True if last LoadNRRDIntensity() run fully succeeded. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
+	bool bVolumeLoadedSuccessfully;
+
+	/** Parsed header of the last loaded NRRD. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
+	FVMNRRDHeader LastHeader;
+
+	/**
+	 * Main entry point for Blueprint / Level.
+	 * Uses NRRDPath, parses header, loads RAW, creates UVolumeTexture.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "VoluMatrix")
+	void LoadNRRDIntensity();
+
+	/** Get the currently loaded volume texture (may be null). */
+	UFUNCTION(BlueprintPure, Category = "VoluMatrix")
+	UVolumeTexture* GetLoadedVolumeTexture() const
+	{
+		return LoadedVolumeTexture;
+	}
+
 private:
-	// ---- Internal implementation helpers (no UFUNCTION) ----
+	/** Keep a reference so GC does not delete the transient volume texture. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix", meta = (AllowPrivateAccess = "true"))
+	UVolumeTexture* LoadedVolumeTexture;
 
-	// Parse the NRRD header at NhdrFilePath into OutHeader. Returns false on error.
-	static bool ParseNRRDHeader(const FString& NhdrFilePath, FVMNRRDHeaderInfo& OutHeader, FString& OutError);
+	// --- Internal helpers ---
 
-	// Read the RAW file referenced by Header.DataFileName into OutBytes.
-	// NhdrFilePath is used as the base directory if DataFileName is relative.
-	static bool LoadRawData(
-		const FString& NhdrFilePath, const FVMNRRDHeaderInfo& Header, TArray<uint8>& OutBytes, FString& OutError);
+	/** Parse minimal 3D NRRD header from disk into FVMNRRDHeader. */
+	bool ParseNRRDHeader(const FString& HeaderFilePath, FVMNRRDHeader& OutHeader) const;
 
-	// Create a transient volume texture (PF_G16 / TSF_G16) from a 16-bit raw buffer.
-	// Assumes bytes contain SizeX * SizeY * SizeZ int16 samples in the order written by the converter.
-	static UVolumeTexture* CreateVolumeTextureFromRaw16(const FVMNRRDHeaderInfo& Header, const TArray<uint8>& Bytes);
+	/** Load RAW file, compute min/max, write back to OutHeader. */
+	bool LoadRawDataAndComputeMinMax(FVMNRRDHeader& InOutHeader, TArray<uint8>& OutRawBytes) const;
 
-	// Compute min / max intensity values from a 16-bit buffer. Purely diagnostic for now.
-	static void ComputeVolumeMinMaxInt16(const TArray<uint8>& Bytes, int16& OutMin, int16& OutMax);
+	/** Create a PF_G16 UVolumeTexture from raw bytes. */
+	UVolumeTexture* CreateVolumeTextureFromRaw(const FVMNRRDHeader& Header, const TArray<uint8>& RawBytes);
+
+	/** Just log and sanity-check; no direct RaymarchResources access here. */
+	void ApplyToRaymarchVolume(UVolumeTexture* VolumeTexture, const FVMNRRDHeader& Header);
 };
