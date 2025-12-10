@@ -25,6 +25,7 @@ public class TBRaymarchProject : ModuleRules
         PrivateDependencyModuleNames.AddRange(
             new string[]
             {
+                "VolumeTextureToolkit"
             });
     }
 }

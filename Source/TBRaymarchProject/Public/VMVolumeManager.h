@@ -28,17 +28,25 @@ class UVolumeTexture;
  *  - sizes: Z Y X  (converter writes in that order)
  */
 USTRUCT(BlueprintType)
-struct FVMNRRDHeader
-{
-	GENERATED_BODY()
+	struct FVMNRRDHeader
+	{
+		GENERATED_BODY()
 
-	// Texture dimensions in Unreal terms (VolumeTexture expects X,Y,Z)
+		// Texture dimensions in Unreal terms (VolumeTexture expects X,Y,Z)
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
 	int32 SizeX = 0;	// columns (Nrrd axis 2)
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
 	int32 SizeY = 0;	// rows    (Nrrd axis 1)
+		UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
+		int32 SizeZ = 0;	// slices  (Nrrd axis 0)
+
+	// Physical spacing (mm) derived from NRRD space directions. Defaults to 1 mm if missing.
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
-	int32 SizeZ = 0;	// slices  (Nrrd axis 0)
+	FVector Spacing = FVector(1.0f);
+
+	// Optional origin from NRRD (mm, right-anterior-superior)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
+	FVector Origin = FVector::ZeroVector;
 
 	// Full absolute path to the raw file
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix")
@@ -112,6 +120,10 @@ private:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix", meta = (AllowPrivateAccess = "true"))
 	UVolumeTexture* LoadedVolumeTexture;
 
+	/** Keep a reference to the transient VolumeAsset we hand to the raymarcher. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VoluMatrix", meta = (AllowPrivateAccess = "true"))
+	class UVolumeAsset* LoadedVolumeAsset;
+
 	// --- Internal helpers ---
 
 	/** Parse minimal 3D NRRD header from disk into FVMNRRDHeader. */
@@ -123,6 +135,9 @@ private:
 	/** Create a PF_G16 UVolumeTexture from raw bytes. */
 	UVolumeTexture* CreateVolumeTextureFromRaw(const FVMNRRDHeader& Header, const TArray<uint8>& RawBytes);
 
-	/** Just log and sanity-check; no direct RaymarchResources access here. */
-	void ApplyToRaymarchVolume(UVolumeTexture* VolumeTexture, const FVMNRRDHeader& Header);
+	/** Build a transient UVolumeAsset around the created texture so we can reuse the plugin init path. */
+	class UVolumeAsset* BuildTransientVolumeAsset(const FVMNRRDHeader& Header, UVolumeTexture* VolumeTexture) const;
+
+	/** Push the prepared asset into the target raymarch volume. */
+	void ApplyToRaymarchVolume(UVolumeTexture* VolumeTexture, class UVolumeAsset* VolumeAsset, const FVMNRRDHeader& Header);
 };

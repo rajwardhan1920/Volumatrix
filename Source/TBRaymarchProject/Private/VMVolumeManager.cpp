@@ -11,6 +11,9 @@
 #include "Logging/LogMacros.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "TextureUtilities.h"
+#include "VolumeAsset/VolumeAsset.h"
+#include "VolumeAsset/VolumeInfo.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogVMVolumeManager, Log, All);
 
@@ -19,6 +22,7 @@ AVMVolumeManager::AVMVolumeManager()
 	PrimaryActorTick.bCanEverTick = false;
 	bVolumeLoadedSuccessfully = false;
 	LoadedVolumeTexture = nullptr;
+	LoadedVolumeAsset = nullptr;
 }
 
 void AVMVolumeManager::BeginPlay()
@@ -50,6 +54,7 @@ void AVMVolumeManager::LoadNRRDIntensity()
 {
 	bVolumeLoadedSuccessfully = false;
 	LoadedVolumeTexture = nullptr;
+	LoadedVolumeAsset = nullptr;
 	LastHeader = FVMNRRDHeader();
 
 	if (NRRDPath.IsEmpty())
@@ -86,14 +91,23 @@ void AVMVolumeManager::LoadNRRDIntensity()
 		return;
 	}
 
+	UVolumeAsset* VolumeAsset = BuildTransientVolumeAsset(Header, VolumeTex);
+	if (!VolumeAsset)
+	{
+		UE_LOG(LogVMVolumeManager, Error, TEXT("Failed to wrap volume texture in VolumeAsset for: %s"), *AbsHeaderPath);
+		return;
+	}
+
 	LoadedVolumeTexture = VolumeTex;
+	LoadedVolumeAsset = VolumeAsset;
 	LastHeader = Header;
 	bVolumeLoadedSuccessfully = true;
 
-	ApplyToRaymarchVolume(VolumeTex, Header);
+	ApplyToRaymarchVolume(VolumeTex, VolumeAsset, Header);
 
-	UE_LOG(LogVMVolumeManager, Log, TEXT("Loaded NRRD '%s' -> %dx%dx%d, min=%d, max=%d"), *AbsHeaderPath, Header.SizeX,
-		Header.SizeY, Header.SizeZ, Header.MinValue, Header.MaxValue);
+	UE_LOG(LogVMVolumeManager, Log,
+		TEXT("Loaded NRRD '%s' -> %dx%dx%d, spacing=%s mm, min=%d, max=%d"), *AbsHeaderPath, Header.SizeX, Header.SizeY,
+		Header.SizeZ, *Header.Spacing.ToString(), Header.MinValue, Header.MaxValue);
 }
 
 // -------------------------------------------------------------------------
@@ -121,6 +135,10 @@ bool AVMVolumeManager::ParseNRRDHeader(const FString& HeaderFilePath, FVMNRRDHea
 	int32 Sizes[3] = {0, 0, 0};
 	FString DataFileRel;
 	bool bLittleEndian = true;
+	FVector SpaceDirs[3];
+	bool bHasSpaceDirs = false;
+	FVector Origin = FVector::ZeroVector;
+	bool bHasOrigin = false;
 
 	for (const FString& RawLine : Lines)
 	{
@@ -180,6 +198,57 @@ bool AVMVolumeManager::ParseNRRDHeader(const FString& HeaderFilePath, FVMNRRDHea
 			const FString Value = Line.Mid(10).TrimStartAndEnd();
 			DataFileRel = Value;
 		}
+		else if (Line.StartsWith(TEXT("space directions:")))
+		{
+			const FString Value = Line.Mid(16).TrimStartAndEnd();
+			TArray<FString> Tokens;
+			Value.ParseIntoArray(Tokens, TEXT(" "), true);
+
+			int32 DirIndex = 0;
+			for (const FString& Token : Tokens)
+			{
+				if (DirIndex >= 3)
+				{
+					break;
+				}
+
+				FString Clean = Token;
+				Clean.ReplaceInline(TEXT("("), TEXT(""));
+				Clean.ReplaceInline(TEXT(")"), TEXT(""));
+
+				TArray<FString> Components;
+				Clean.ParseIntoArray(Components, TEXT(","), true);
+
+				if (Components.Num() == 3)
+				{
+					const float X = FCString::Atof(*Components[0]);
+					const float Y = FCString::Atof(*Components[1]);
+					const float Z = FCString::Atof(*Components[2]);
+					SpaceDirs[DirIndex] = FVector(X, Y, Z);
+					DirIndex++;
+				}
+			}
+
+			bHasSpaceDirs = (DirIndex == 3);
+		}
+		else if (Line.StartsWith(TEXT("space origin:")))
+		{
+			const FString Value = Line.Mid(13).TrimStartAndEnd();
+			FString Clean = Value;
+			Clean.ReplaceInline(TEXT("("), TEXT(""));
+			Clean.ReplaceInline(TEXT(")"), TEXT(""));
+
+			TArray<FString> Components;
+			Clean.ParseIntoArray(Components, TEXT(","), true);
+
+			if (Components.Num() == 3)
+			{
+				Origin.X = FCString::Atof(*Components[0]);
+				Origin.Y = FCString::Atof(*Components[1]);
+				Origin.Z = FCString::Atof(*Components[2]);
+				bHasOrigin = true;
+			}
+		}
 	}
 
 	if (Sizes[0] <= 0 || Sizes[1] <= 0 || Sizes[2] <= 0)
@@ -200,6 +269,15 @@ bool AVMVolumeManager::ParseNRRDHeader(const FString& HeaderFilePath, FVMNRRDHea
 	OutHeader.SizeX = Sizes[2];
 	OutHeader.BytesPerVoxel = 2;
 	OutHeader.bLittleEndian = bLittleEndian;
+	if (bHasSpaceDirs)
+	{
+		// NRRD order: dirs[0]=axis 0 (Z), dirs[1]=axis 1 (Y), dirs[2]=axis 2 (X).
+		OutHeader.Spacing = FVector(SpaceDirs[2].Size(), SpaceDirs[1].Size(), SpaceDirs[0].Size());
+	}
+	if (bHasOrigin)
+	{
+		OutHeader.Origin = Origin;
+	}
 
 	const FString HeaderDir = FPaths::GetPath(HeaderFilePath);
 	OutHeader.RawFilePath = FPaths::ConvertRelativePathToFull(FPaths::Combine(HeaderDir, DataFileRel));
@@ -262,6 +340,19 @@ bool AVMVolumeManager::LoadRawDataAndComputeMinMax(FVMNRRDHeader& InOutHeader, T
 		return false;
 	}
 
+	// Handle endian swap if needed (NRRD provides endianness info).
+	if (!InOutHeader.bLittleEndian && PLATFORM_LITTLE_ENDIAN)
+	{
+		for (int32 i = 0; i < OutRawBytes.Num(); i += 2)
+		{
+			uint8 Temp = OutRawBytes[i];
+			OutRawBytes[i] = OutRawBytes[i + 1];
+			OutRawBytes[i + 1] = Temp;
+		}
+	}
+
+	DataPtr = reinterpret_cast<const int16*>(OutRawBytes.GetData());
+
 	int16 MinVal = DataPtr[0];
 	int16 MaxVal = DataPtr[0];
 
@@ -298,88 +389,111 @@ UVolumeTexture* AVMVolumeManager::CreateVolumeTextureFromRaw(const FVMNRRDHeader
 		return nullptr;
 	}
 
-	// Create transient VolumeTexture
-	UVolumeTexture* VolumeTex = NewObject<UVolumeTexture>(GetTransientPackage(), NAME_None, RF_Transient);
-	if (!VolumeTex)
-	{
-		UE_LOG(LogVMVolumeManager, Error, TEXT("Failed to allocate UVolumeTexture."));
-		return nullptr;
-	}
-
-	// Setup basic flags
-	VolumeTex->bNotOfflineProcessed = true;
-	VolumeTex->MipGenSettings = TMGS_NoMipmaps;
-	VolumeTex->SRGB = false;
-	VolumeTex->CompressionSettings = TC_Default;
-	VolumeTex->NeverStream = true;
-	VolumeTex->Filter = TF_Bilinear;
-
-	// Initialize the source with one G16 mip
-	VolumeTex->Source.Init(Header.SizeX, Header.SizeY, Header.SizeZ,
-		/*NumSlices=*/1, TSF_G16);
-
-	uint8* DestData = VolumeTex->Source.LockMip(0);
-	if (!DestData)
-	{
-		UE_LOG(LogVMVolumeManager, Error, TEXT("Failed to lock VolumeTexture mip 0."));
-		return nullptr;
-	}
-
 	const int64 ExpectedBytes =
 		static_cast<int64>(Header.SizeX) * static_cast<int64>(Header.SizeY) * static_cast<int64>(Header.SizeZ) * sizeof(uint16);
 
-	const int64 CopyBytes = FMath::Min<int64>(ExpectedBytes, RawBytes.Num());
-	if (CopyBytes > 0)
+	if (RawBytes.Num() < ExpectedBytes)
 	{
-		FMemory::Memcpy(DestData, RawBytes.GetData(), static_cast<SIZE_T>(CopyBytes));
+		UE_LOG(LogVMVolumeManager, Warning,
+			TEXT("CreateVolumeTextureFromRaw: buffer smaller than expected (%d < %lld). Rendering may show padded zeros."),
+			RawBytes.Num(), ExpectedBytes);
 	}
 
-	// Zero-fill any remainder
-	if (CopyBytes < ExpectedBytes)
+	UVolumeTexture* VolumeTex = nullptr;
+	const bool bCreated = UVolumeTextureToolkit::CreateVolumeTextureTransient(
+		VolumeTex, PF_G16, FIntVector(Header.SizeX, Header.SizeY, Header.SizeZ), const_cast<uint8*>(RawBytes.GetData()), true);
+
+	if (!bCreated || !VolumeTex)
 	{
-		const int64 Remaining = ExpectedBytes - CopyBytes;
-		FMemory::Memset(DestData + CopyBytes, 0, static_cast<SIZE_T>(Remaining));
-		UE_LOG(LogVMVolumeManager, Warning, TEXT("CreateVolumeTextureFromRaw: zero-filled %lld trailing bytes."), Remaining);
+		UE_LOG(LogVMVolumeManager, Error, TEXT("UVolumeTextureToolkit::CreateVolumeTextureTransient failed."));
+		return nullptr;
 	}
 
-	VolumeTex->Source.UnlockMip(0);
-
-	// Create RHI resource
-	VolumeTex->UpdateResource();
+	// Match plugin defaults
+	VolumeTex->Filter = TF_Bilinear;
+	VolumeTex->MipGenSettings = TMGS_NoMipmaps;
+	VolumeTex->CompressionSettings = TC_Default;
 
 	return VolumeTex;
 }
 
 // -------------------------------------------------------------------------
-// Hook into Raymarcher (no internals touched)
+// Build a transient VolumeAsset so we can reuse the plugin's init path
 // -------------------------------------------------------------------------
 
-void AVMVolumeManager::ApplyToRaymarchVolume(UVolumeTexture* VolumeTexture, const FVMNRRDHeader& Header)
+UVolumeAsset* AVMVolumeManager::BuildTransientVolumeAsset(const FVMNRRDHeader& Header, UVolumeTexture* VolumeTexture) const
+{
+	if (!VolumeTexture)
+	{
+		return nullptr;
+	}
+
+	UVolumeAsset* VolumeAsset = UVolumeAsset::CreateTransient(TEXT("VMRuntimeVolume"));
+	if (!VolumeAsset)
+	{
+		return nullptr;
+	}
+
+	FVolumeInfo Info;
+	Info.bParseWasSuccessful = true;
+	Info.DataFileName = FPaths::GetCleanFilename(Header.RawFilePath);
+	Info.OriginalFormat = EVolumeVoxelFormat::SignedShort;
+	Info.ActualFormat = EVolumeVoxelFormat::SignedShort;
+	Info.Dimensions = FIntVector(Header.SizeX, Header.SizeY, Header.SizeZ);
+	Info.Spacing = Header.Spacing;
+	Info.WorldDimensions =
+		FVector(Header.Spacing.X * Header.SizeX, Header.Spacing.Y * Header.SizeY, Header.Spacing.Z * Header.SizeZ);
+	Info.bIsNormalized = false;
+	Info.MinValue = Header.MinValue;
+	Info.MaxValue = Header.MaxValue;
+	Info.BytesPerVoxel = FVolumeInfo::VoxelFormatByteSize(Info.OriginalFormat);
+	Info.bIsSigned = FVolumeInfo::IsVoxelFormatSigned(Info.OriginalFormat);
+	Info.DefaultWindowingParameters.Center = (static_cast<float>(Header.MinValue) + static_cast<float>(Header.MaxValue)) * 0.5f;
+	Info.DefaultWindowingParameters.Width =
+		FMath::Max(1.0f, static_cast<float>(Header.MaxValue - Header.MinValue));
+	Info.DefaultWindowingParameters.LowCutoff = true;
+	Info.DefaultWindowingParameters.HighCutoff = true;
+
+	VolumeAsset->DataTexture = VolumeTexture;
+	VolumeAsset->ImageInfo = Info;
+	VolumeAsset->TransferFuncCurve = nullptr;	// Let RaymarchVolume create default TF texture
+
+	return VolumeAsset;
+}
+
+// -------------------------------------------------------------------------
+// Hook into Raymarcher (uses plugin's public API)
+// -------------------------------------------------------------------------
+
+void AVMVolumeManager::ApplyToRaymarchVolume(UVolumeTexture* VolumeTexture, UVolumeAsset* VolumeAsset,
+	const FVMNRRDHeader& Header)
 {
 	if (!TargetRaymarchVolume)
 	{
 		UE_LOG(LogVMVolumeManager, Warning,
-			TEXT("ApplyToRaymarchVolume: TargetRaymarchVolume is null. "
-				 "Use GetLoadedVolumeTexture() in BP to wire into RaymarchResources."));
+			TEXT("ApplyToRaymarchVolume: TargetRaymarchVolume is null. Assign it in BP to see the volume."));
 		return;
 	}
 
-	if (!VolumeTexture)
+	if (!VolumeTexture || !VolumeAsset)
 	{
-		UE_LOG(LogVMVolumeManager, Warning, TEXT("ApplyToRaymarchVolume: VolumeTexture is null."));
+		UE_LOG(LogVMVolumeManager, Warning, TEXT("ApplyToRaymarchVolume: VolumeTexture or VolumeAsset is null."));
 		return;
 	}
 
-	// We deliberately do NOT touch FBasicRaymarchRenderingResources here because
-	// your RaymarchTypes.h has changed and field names are not stable.
-	// Instead, you will:
-	//   - In Blueprint, read GetLoadedVolumeTexture()
-	//   - Use 'Set Members in BasicRaymarchRenderingResources' on RaymarchResources
-	//   - Assign the correct field (e.g. DataVolumeTextureRef / IntensityTexture / etc.)
-	//   - Then call TargetRaymarchVolume->SetAllMaterialParameters() from Blueprint.
+	const bool bSet = TargetRaymarchVolume->SetVolumeAsset(VolumeAsset);
+	if (!bSet)
+	{
+		UE_LOG(LogVMVolumeManager, Error, TEXT("RaymarchVolume rejected VolumeAsset for '%s'"), *NRRDPath);
+		return;
+	}
+
+	// RaymarchVolume::SetVolumeAsset already initializes resources and sets materials.
+	TargetRaymarchVolume->SetAllMaterialParameters();
+	TargetRaymarchVolume->SetMaterialWindowingParameters();
 
 	UE_LOG(LogVMVolumeManager, Log,
-		TEXT("ApplyToRaymarchVolume: Texture '%s' ready (%dx%dx%d, min=%d, max=%d). "
-			 "Wire it in Blueprint via GetLoadedVolumeTexture()."),
-		*VolumeTexture->GetName(), Header.SizeX, Header.SizeY, Header.SizeZ, Header.MinValue, Header.MaxValue);
+		TEXT("RaymarchVolume bound volume '%s' (%dx%dx%d). Window center=%.2f width=%.2f"), *VolumeTexture->GetName(),
+		Header.SizeX, Header.SizeY, Header.SizeZ, VolumeAsset->ImageInfo.DefaultWindowingParameters.Center,
+		VolumeAsset->ImageInfo.DefaultWindowingParameters.Width);
 }
