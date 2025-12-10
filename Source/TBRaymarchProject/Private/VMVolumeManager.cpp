@@ -91,6 +91,9 @@ void AVMVolumeManager::LoadNRRDIntensity()
 		return;
 	}
 
+	UE_LOG(LogVMVolumeManager, Log, TEXT("Created VolumeTexture %s (%d, %d, %d)"), *VolumeTex->GetName(), VolumeTex->GetSizeX(),
+		VolumeTex->GetSizeY(), VolumeTex->GetSizeZ());
+
 	UVolumeAsset* VolumeAsset = BuildTransientVolumeAsset(Header, VolumeTex);
 	if (!VolumeAsset)
 	{
@@ -375,7 +378,7 @@ bool AVMVolumeManager::LoadRawDataAndComputeMinMax(FVMNRRDHeader& InOutHeader, T
 // UVolumeTexture creation (UE 5.4-safe)
 // -------------------------------------------------------------------------
 
-UVolumeTexture* AVMVolumeManager::CreateVolumeTextureFromRaw(const FVMNRRDHeader& Header, const TArray<uint8>& RawBytes)
+UVolumeTexture* AVMVolumeManager::CreateVolumeTextureFromRaw(FVMNRRDHeader& Header, const TArray<uint8>& RawBytes)
 {
 	if (Header.SizeX <= 0 || Header.SizeY <= 0 || Header.SizeZ <= 0)
 	{
@@ -383,36 +386,36 @@ UVolumeTexture* AVMVolumeManager::CreateVolumeTextureFromRaw(const FVMNRRDHeader
 		return nullptr;
 	}
 
-	if (RawBytes.Num() <= 0)
-	{
-		UE_LOG(LogVMVolumeManager, Error, TEXT("Empty RAW data."));
-		return nullptr;
-	}
-
-	const int64 ExpectedBytes =
-		static_cast<int64>(Header.SizeX) * static_cast<int64>(Header.SizeY) * static_cast<int64>(Header.SizeZ) * sizeof(uint16);
+	const int64 NumVoxels = static_cast<int64>(Header.SizeX) * Header.SizeY * Header.SizeZ;
+	const int64 ExpectedBytes = NumVoxels * sizeof(int16);
 
 	if (RawBytes.Num() < ExpectedBytes)
 	{
-		UE_LOG(LogVMVolumeManager, Warning,
-			TEXT("CreateVolumeTextureFromRaw: buffer smaller than expected (%d < %lld). Rendering may show padded zeros."),
-			RawBytes.Num(), ExpectedBytes);
+		UE_LOG(LogVMVolumeManager, Error,
+			TEXT("CreateVolumeTextureFromRaw: RawBytes too small. Have %d, expected at least %lld"), RawBytes.Num(), ExpectedBytes);
+		return nullptr;
 	}
 
+	// Create transient volume texture directly from raw int16 data.
 	UVolumeTexture* VolumeTex = nullptr;
 	const bool bCreated = UVolumeTextureToolkit::CreateVolumeTextureTransient(
 		VolumeTex, PF_G16, FIntVector(Header.SizeX, Header.SizeY, Header.SizeZ), const_cast<uint8*>(RawBytes.GetData()), true);
 
 	if (!bCreated || !VolumeTex)
 	{
-		UE_LOG(LogVMVolumeManager, Error, TEXT("UVolumeTextureToolkit::CreateVolumeTextureTransient failed."));
+		UE_LOG(LogVMVolumeManager, Error, TEXT("CreateVolumeTextureFromRaw: CreateVolumeTextureTransient failed"));
 		return nullptr;
 	}
 
-	// Match plugin defaults
+	VolumeTex->SRGB = false;
 	VolumeTex->Filter = TF_Bilinear;
 	VolumeTex->MipGenSettings = TMGS_NoMipmaps;
 	VolumeTex->CompressionSettings = TC_Default;
+
+	VolumeTex->UpdateResource();
+
+	UE_LOG(LogVMVolumeManager, Log, TEXT("CreateVolumeTextureFromRaw: Created PF_G16 VolumeTexture %dx%dx%d"), Header.SizeX,
+		Header.SizeY, Header.SizeZ);
 
 	return VolumeTex;
 }
@@ -456,7 +459,14 @@ UVolumeAsset* AVMVolumeManager::BuildTransientVolumeAsset(const FVMNRRDHeader& H
 
 	VolumeAsset->DataTexture = VolumeTexture;
 	VolumeAsset->ImageInfo = Info;
-	VolumeAsset->TransferFuncCurve = nullptr;	// Let RaymarchVolume create default TF texture
+	if (TransferFunctionOverride)
+	{
+		VolumeAsset->TransferFuncCurve = TransferFunctionOverride;
+	}
+	else
+	{
+		VolumeAsset->TransferFuncCurve = nullptr;	// Let RaymarchVolume create default TF texture
+	}
 
 	return VolumeAsset;
 }

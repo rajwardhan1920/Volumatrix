@@ -12,6 +12,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "Curves/CurveLinearColor.h"
 
 #include "VMVolumeManager.generated.h"
 
@@ -27,7 +28,7 @@ class UVolumeTexture;
  *  - endian: little
  *  - sizes: Z Y X  (converter writes in that order)
  */
-USTRUCT(BlueprintType)
+	USTRUCT(BlueprintType)
 	struct FVMNRRDHeader
 	{
 		GENERATED_BODY()
@@ -85,6 +86,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VoluMatrix")
 	ARaymarchVolume* TargetRaymarchVolume;
 
+	/** Optional: override transfer function; if null, plugin will create default TF. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VoluMatrix")
+	UCurveLinearColor* TransferFunctionOverride;
+
 	/**
 	 * Absolute path to the .nhdr file.
 	 * Example:
@@ -133,7 +138,7 @@ private:
 	bool LoadRawDataAndComputeMinMax(FVMNRRDHeader& InOutHeader, TArray<uint8>& OutRawBytes) const;
 
 	/** Create a PF_G16 UVolumeTexture from raw bytes. */
-	UVolumeTexture* CreateVolumeTextureFromRaw(const FVMNRRDHeader& Header, const TArray<uint8>& RawBytes);
+	UVolumeTexture* CreateVolumeTextureFromRaw(FVMNRRDHeader& Header, const TArray<uint8>& RawBytes);
 
 	/** Build a transient UVolumeAsset around the created texture so we can reuse the plugin init path. */
 	class UVolumeAsset* BuildTransientVolumeAsset(const FVMNRRDHeader& Header, UVolumeTexture* VolumeTexture) const;
