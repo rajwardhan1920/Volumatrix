@@ -137,8 +137,8 @@ private:
 	/** Load RAW file, compute min/max, write back to OutHeader. */
 	bool LoadRawDataAndComputeMinMax(FVMNRRDHeader& InOutHeader, TArray<uint8>& OutRawBytes) const;
 
-	/** Create a PF_G16 UVolumeTexture from raw bytes. */
-	UVolumeTexture* CreateVolumeTextureFromRaw(FVMNRRDHeader& Header, const TArray<uint8>& RawBytes);
+        /** Create a PF_G16 UVolumeTexture from raw bytes. */
+        UVolumeTexture* CreateVolumeTextureFromRaw(const FVMNRRDHeader& Header, const TArray<uint8>& RawBytes);
 
 	/** Build a transient UVolumeAsset around the created texture so we can reuse the plugin init path. */
 	class UVolumeAsset* BuildTransientVolumeAsset(const FVMNRRDHeader& Header, UVolumeTexture* VolumeTexture) const;
