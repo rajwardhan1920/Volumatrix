@@ -378,14 +378,9 @@ bool AVMVolumeManager::LoadRawDataAndComputeMinMax(FVMNRRDHeader& InOutHeader, T
 // UVolumeTexture creation (UE 5.4-safe)
 // -------------------------------------------------------------------------
 
-UVolumeTexture* AVMVolumeManager::CreateVolumeTextureFromRaw(FVMNRRDHeader& Header, const TArray<uint8>& RawBytes)
+UVolumeTexture* AVMVolumeManager::CreateVolumeTextureFromRaw(const FVMNRRDHeader& Header,
+	const TArray<uint8>& RawBytes)
 {
-	if (Header.SizeX <= 0 || Header.SizeY <= 0 || Header.SizeZ <= 0)
-	{
-		UE_LOG(LogVMVolumeManager, Error, TEXT("Invalid volume sizes: %d x %d x %d"), Header.SizeX, Header.SizeY, Header.SizeZ);
-		return nullptr;
-	}
-
 	const int64 NumVoxels = static_cast<int64>(Header.SizeX) * Header.SizeY * Header.SizeZ;
 	const int64 ExpectedBytes = NumVoxels * sizeof(int16);
 
@@ -396,10 +391,37 @@ UVolumeTexture* AVMVolumeManager::CreateVolumeTextureFromRaw(FVMNRRDHeader& Head
 		return nullptr;
 	}
 
-	// Create transient volume texture directly from raw int16 data.
+	// Interpret input as signed 16-bit
+	const int16* Src = reinterpret_cast<const int16*>(RawBytes.GetData());
+
+	// Compute min/max in signed space (this matches what Slicer / HU expect)
+	int16 MinV = Src[0];
+	int16 MaxV = Src[0];
+	for (int64 i = 1; i < NumVoxels; ++i)
+	{
+		const int16 V = Src[i];
+		MinV = FMath::Min(MinV, V);
+		MaxV = FMath::Max(MaxV, V);
+	}
+
+	// Shift signed range to unsigned 0..65535 and store as uint16
+	TArray<uint16> Shifted;
+	Shifted.SetNumUninitialized(NumVoxels);
+
+	for (int64 i = 0; i < NumVoxels; ++i)
+	{
+		const int32 ShiftedV = static_cast<int32>(Src[i]) - static_cast<int32>(MinV); // >= 0
+		Shifted[i] = static_cast<uint16>(FMath::Clamp<int32>(ShiftedV, 0, 65535));
+	}
+
 	UVolumeTexture* VolumeTex = nullptr;
 	const bool bCreated = UVolumeTextureToolkit::CreateVolumeTextureTransient(
-		VolumeTex, PF_G16, FIntVector(Header.SizeX, Header.SizeY, Header.SizeZ), const_cast<uint8*>(RawBytes.GetData()), true);
+		VolumeTex,
+		PF_G16, // unsigned 16-bit
+		FIntVector(Header.SizeX, Header.SizeY, Header.SizeZ),
+		reinterpret_cast<uint8*>(Shifted.GetData()),
+		true // bCreateMipMaps
+	);
 
 	if (!bCreated || !VolumeTex)
 	{
@@ -411,13 +433,18 @@ UVolumeTexture* AVMVolumeManager::CreateVolumeTextureFromRaw(FVMNRRDHeader& Head
 	VolumeTex->Filter = TF_Bilinear;
 	VolumeTex->MipGenSettings = TMGS_NoMipmaps;
 	VolumeTex->CompressionSettings = TC_Default;
-
 	VolumeTex->UpdateResource();
 
-	UE_LOG(LogVMVolumeManager, Log, TEXT("CreateVolumeTextureFromRaw: Created PF_G16 VolumeTexture %dx%dx%d"), Header.SizeX,
-		Header.SizeY, Header.SizeZ);
+	// IMPORTANT: push min/max back into LastHeader so BuildTransientVolumeAsset sees the real intensity range
+	LastHeader.MinValue = MinV;
+	LastHeader.MaxValue = MaxV;
 
-	return VolumeTex;
+        UE_LOG(LogVMVolumeManager, Log,
+                TEXT("CreateVolumeTextureFromRaw: Created PF_G16 VolumeTexture %dx%dx%d (Min=%d, Max=%d, ShiftedRange=%d)"),
+                Header.SizeX, Header.SizeY, Header.SizeZ,
+                MinV, MaxV, (int32)(MaxV - MinV));
+
+        return VolumeTex;
 }
 
 // -------------------------------------------------------------------------
@@ -439,21 +466,23 @@ UVolumeAsset* AVMVolumeManager::BuildTransientVolumeAsset(const FVMNRRDHeader& H
 
 	FVolumeInfo Info;
 	Info.bParseWasSuccessful = true;
-	Info.DataFileName = FPaths::GetCleanFilename(Header.RawFilePath);
-	Info.OriginalFormat = EVolumeVoxelFormat::SignedShort;
-	Info.ActualFormat = EVolumeVoxelFormat::SignedShort;
-	Info.Dimensions = FIntVector(Header.SizeX, Header.SizeY, Header.SizeZ);
-	Info.Spacing = Header.Spacing;
-	Info.WorldDimensions =
-		FVector(Header.Spacing.X * Header.SizeX, Header.Spacing.Y * Header.SizeY, Header.Spacing.Z * Header.SizeZ);
-	Info.bIsNormalized = false;
-	Info.MinValue = Header.MinValue;
-	Info.MaxValue = Header.MaxValue;
-	Info.BytesPerVoxel = FVolumeInfo::VoxelFormatByteSize(Info.OriginalFormat);
-	Info.bIsSigned = FVolumeInfo::IsVoxelFormatSigned(Info.OriginalFormat);
-	Info.DefaultWindowingParameters.Center = (static_cast<float>(Header.MinValue) + static_cast<float>(Header.MaxValue)) * 0.5f;
-	Info.DefaultWindowingParameters.Width =
-		FMath::Max(1.0f, static_cast<float>(Header.MaxValue - Header.MinValue));
+        Info.DataFileName = FPaths::GetCleanFilename(Header.RawFilePath);
+        // Data in the texture is now unsigned 16-bit (PF_G16).
+        // But we want windowing to work in *signed* HU space, so we keep Min/Max as signed range.
+        Info.OriginalFormat = EVolumeVoxelFormat::UnsignedShort;
+        Info.ActualFormat = EVolumeVoxelFormat::UnsignedShort;
+        Info.Dimensions = FIntVector(Header.SizeX, Header.SizeY, Header.SizeZ);
+        Info.Spacing = Header.Spacing;
+        Info.WorldDimensions =
+                FVector(Header.Spacing.X * Header.SizeX, Header.Spacing.Y * Header.SizeY, Header.Spacing.Z * Header.SizeZ);
+        Info.bIsNormalized = false;
+        Info.MinValue = LastHeader.MinValue; // from CreateVolumeTextureFromRaw
+        Info.MaxValue = LastHeader.MaxValue;
+        Info.BytesPerVoxel = FVolumeInfo::VoxelFormatByteSize(Info.OriginalFormat);
+        Info.bIsSigned = false;
+        Info.DefaultWindowingParameters.Center = (Info.MinValue + Info.MaxValue) * 0.5f;
+        Info.DefaultWindowingParameters.Width =
+                FMath::Max(1.0f, static_cast<float>(Info.MaxValue - Info.MinValue));
 	Info.DefaultWindowingParameters.LowCutoff = true;
 	Info.DefaultWindowingParameters.HighCutoff = true;
 
